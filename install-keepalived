@@ -1,0 +1,109 @@
+#!/bin/bash
+# Алгоритм работы основывается на следующей конфигурации безопасности целевой системы:
+# на хост цель есть ssh доступ по паролю и/или ключу для простого пользователя,
+# для пользователя root известен пароль для повышения привилегий, а так же есть shh доступ только по ключу.
+# Данная схема весьма популярна и используется во многих современных дистрибутивах.
+
+# Первоначально скрипт генерирует пару ключей, устанавливает ключ для простого пользователя,
+# повышает привилегии и копирует ключ для пользователя root, проверяя доступность по ключу.
+
+# Далее скрипт подключается от имени пользователя root и выполняет все необходимые действия
+
+# Последовательность действий и конфигурационные параметры описываются во второй части скрипта, ниже по тексту.
+# Для вариативности удобно использовать альтернативную копию скрипта, предварительно изменив:
+# virtual_router_id и auth_pass, а так же другие необходимые параметры.
+
+# Так же данный скрипт легко модернизируется для автоматизации любых других задач связанных с администрированием linux систем.
+
+# Преимущества данного решения это компактность, простота и отсутствие каких либо зависимостей.
+# Нет потребности в ansible, sudo и каких либо дополнительных настройках целевой и управляющей ОС.
+
+# В данной реализации для работы в не интерактивном режиме используются расширенные параметры
+# ssh клиента -oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null.
+# Проверка доступа по ключу реализована отключением парольной аунтификации (-oPasswordAuthentication=no)
+# и проверкой regex условия на то, что в конце вывода результирующей команды указана 1ю
+
+# Примечательный факт: данный алгоритм был первоначально реализован мной в рамках выполнения лабораторной работы по установки ansible.
+# Данная работа расширила его функционал, добавила проверки и многократное не интерактивное использование в пакетном режиме.
+
+if [ $# -eq 0 ]; then
+    echo "Use: $0 username@hostname"
+    exit
+fi
+
+# определение переменных из аргументов запуска
+
+export username=`echo $1 | awk -F"@" '{ print $1}'`
+host=`echo $1 | awk -F"@" '{ print $2}'`
+
+# Генерация пары ключей если их еще нет
+if [ ! -f ~/.ssh/id_rsa ]; then
+    ssh-keygen -N "" -f ~/.ssh/id_rsa
+fi
+
+# Проверка доступа в случае отсутствия его настройка
+if [[ ! `ssh -oPasswordAuthentication=no -oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null root@$host "echo 1" 2>&1` =~ 1$ ]]; then
+    # Подготовка доступа.
+    # Установка публичного  ключа для простого пользователя
+    ssh-copy-id -oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null $1
+    # Повышение привилегий и установка ключа для пользователя root
+    echo "Enter root password on $host"
+    ssh -oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null -t $1 "su - -c \"tail -1 ~$username/.ssh/authorized_keys > ~/.ssh/authorized_keys\""
+    if [[ ! `ssh -oPasswordAuthentication=no -oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null root@$host "echo 1 2>&1"` =~ 1$ ]]; then
+	echo "Ошибка! Возможно не верный пароль пользователя root. Повторите попытку."
+	exit 1
+    else
+	echo "Доступ по ключу для пользователя root установлен!"
+    fi
+else
+    echo "Доступ по ключу для пользователя root уже имеется."
+fi
+
+# Выполнение команд на удаленной стороне
+echo	 "
+if [ ! -f /usr/sbin/keepalived ]; then
+    apt-get update && apt-get -y dist-upgrade
+    apt-get -y install keepalived
+fi
+
+if [ ! -f /etc/keepalived/keepalived.conf-orig ]; then
+    cp /etc/keepalived/keepalived.conf /etc/keepalived/keepalived.conf-orig
+fi
+
+cat <<'EOF' > /etc/keepalived/keepalived.conf
+global_defs {
+    enable_script_security
+}
+
+vrrp_script myhealth {
+    script \"/bin/nc -z -w 2 127.0.0.1 22\"
+    interval 120
+    user nobody
+}
+
+vrrp_instance VI_1 {
+    state BACKUP
+    interface enp0s3
+    virtual_router_id 1
+    priority 100
+    advert_int 1
+    nopreempt
+#    notify /etc/keepalived/keepalived-notify.sh root
+    authentication {
+        auth_type PASS
+        auth_pass Ruc5oHX36wHhJamSXNT9
+    }
+    virtual_ipaddress {
+        192.168.20.170
+    }
+    track_script {
+        myhealth
+    }
+}
+EOF
+systemctl enable keepalived
+systemctl restart keepalived
+systemctl --no-pager -l status keepalived
+date
+exit
+" | ssh -tt -oPasswordAuthentication=no -oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null root@$host
